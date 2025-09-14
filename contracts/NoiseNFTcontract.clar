@@ -159,13 +159,13 @@
     (asserts! (and (>= max-decibel MIN_DECIBEL) (<= max-decibel MAX_DECIBEL)) ERR_INVALID_DECIBEL)
     (asserts! (or (not is-quiet-zone) (<= max-decibel QUIET_ZONE_LIMIT)) ERR_INVALID_DECIBEL)
     
-    (try! (map-set zones zone-id {
+    (map-set zones zone-id {
       name: name,
       max-decibel: max-decibel,
       current-usage: u0,
       is-quiet-zone: is-quiet-zone,
       premium-multiplier: premium
-    }))
+    })
     
     (map-set zone-owners zone-id tx-sender)
     (var-set next-zone-id (+ zone-id u1))
@@ -185,7 +185,7 @@
     (
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
       (zone-owner (unwrap! (map-get? zone-owners zone-id) ERR_UNAUTHORIZED))
-      (expiry-block (+ block-height duration-blocks))
+      (expiry-block (+ stacks-block-height duration-blocks))
     )
     (asserts! (is-eq tx-sender zone-owner) ERR_UNAUTHORIZED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
@@ -208,7 +208,7 @@
   (let
     (
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
-      (timestamp block-height)
+      (timestamp stacks-block-height)
     )
     (asserts! (and (>= decibel-level MIN_DECIBEL) (<= decibel-level MAX_DECIBEL)) ERR_INVALID_DECIBEL)
     
@@ -236,7 +236,7 @@
     (
       (permit-id (var-get next-permit-id))
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
-      (fee (calculate-permit-fee zone-id requested-decibels duration-blocks))
+      (fee (unwrap! (calculate-permit-fee zone-id requested-decibels duration-blocks) ERR_NOT_FOUND))
     )
     (asserts! (and (>= requested-decibels MIN_DECIBEL) (<= requested-decibels MAX_DECIBEL)) ERR_INVALID_DECIBEL)
     
@@ -269,8 +269,8 @@
     (map-set construction-permits permit-id
       (merge permit { 
         approved: true,
-        start-block: block-height,
-        end-block: (+ block-height (get duration-blocks permit))
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height (get duration-blocks permit))
       })
     )
     
@@ -334,7 +334,7 @@
       (proposal-id (var-get next-proposal-id))
     )
     (asserts! (and (>= proposed-max-decibel MIN_DECIBEL) (<= proposed-max-decibel MAX_DECIBEL)) ERR_INVALID_DECIBEL)
-    (asserts! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND)
+    (asserts! (is-some (map-get? zones zone-id)) ERR_ZONE_NOT_FOUND)
     
     (map-set proposals proposal-id {
       title: title,
@@ -342,8 +342,8 @@
       zone-id: zone-id,
       proposed-max-decibel: proposed-max-decibel,
       proposer: tx-sender,
-      start-block: block-height,
-      end-block: (+ block-height VOTING_PERIOD),
+      start-block: stacks-block-height,
+      end-block: (+ stacks-block-height VOTING_PERIOD),
       yes-votes: u0,
       no-votes: u0,
       executed: false
@@ -360,7 +360,7 @@
       (proposal (unwrap! (map-get? proposals proposal-id) ERR_NOT_FOUND))
       (current-vote (map-get? votes { proposal-id: proposal-id, voter: tx-sender }))
     )
-    (asserts! (< block-height (get end-block proposal)) ERR_VOTING_PERIOD_ACTIVE)
+    (asserts! (< stacks-block-height (get end-block proposal)) ERR_VOTING_PERIOD_ACTIVE)
     (asserts! (is-none current-vote) ERR_ALREADY_VOTED)
     
     (map-set votes { proposal-id: proposal-id, voter: tx-sender } vote-yes)
@@ -384,7 +384,7 @@
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
       (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
     )
-    (asserts! (>= block-height (get end-block proposal)) ERR_VOTING_PERIOD_ACTIVE)
+    (asserts! (>= stacks-block-height (get end-block proposal)) ERR_VOTING_PERIOD_ACTIVE)
     (asserts! (not (get executed proposal)) ERR_ALREADY_EXISTS)
     (asserts! (>= total-votes MIN_VOTES_REQUIRED) ERR_INVALID_VOTE)
     (asserts! (> (get yes-votes proposal) (get no-votes proposal)) ERR_INVALID_VOTE)
@@ -437,7 +437,7 @@
   (map-get? votes { proposal-id: proposal-id, voter: voter })
 )
 
-(define-read-only (calculate-permit-fee (zone-id uint) (requested-decibels uint) (duration-blocks uint))
+(define-private (calculate-permit-fee (zone-id uint) (requested-decibels uint) (duration-blocks uint))
   (let
     (
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
@@ -461,6 +461,10 @@
 )
 
 ;; private functions
+
+(define-private (max (a uint) (b uint))
+  (if (> a b) a b)
+)
 
 (define-private (transfer-allowance (zone-id uint) (from principal) (to principal) (amount uint))
   (let
