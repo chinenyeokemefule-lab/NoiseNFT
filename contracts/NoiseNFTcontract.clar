@@ -38,6 +38,11 @@
 (define-constant ERR_VOTING_PERIOD_ACTIVE (err u108))
 (define-constant ERR_ALREADY_VOTED (err u109))
 (define-constant ERR_INVALID_VOTE (err u110))
+(define-constant ERR_CONTRACT_PAUSED (err u111))
+(define-constant ERR_INVALID_PRINCIPAL (err u112))
+(define-constant ERR_ALLOWANCE_EXPIRED (err u113))
+(define-constant ERR_OVERFLOW (err u114))
+(define-constant ERR_REENTRANCY (err u115))
 
 ;; Maximum decibel levels
 (define-constant MAX_DECIBEL u120)
@@ -54,6 +59,8 @@
 (define-data-var next-zone-id uint u1)
 (define-data-var next-permit-id uint u1)
 (define-data-var next-proposal-id uint u1)
+(define-data-var contract-paused bool false)
+(define-data-var reentrancy-guard bool false)
 
 ;; data maps
 ;; Zone management
@@ -147,7 +154,43 @@
   uint ;; zone-id
   uint ;; premium percentage (100 = 100%)
 )
+
+;; Admin whitelist for emergency functions
+(define-map admins
+  principal
+  bool
+)
+
+;; Initialize contract owner as admin
+(map-set admins CONTRACT_OWNER true)
+
 ;; public functions
+
+;; Emergency pause function
+(define-public (pause-contract)
+  (begin
+    (asserts! (default-to false (map-get? admins tx-sender)) ERR_UNAUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (default-to false (map-get? admins tx-sender)) ERR_UNAUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
+
+(define-public (add-admin (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq new-admin CONTRACT_OWNER)) ERR_INVALID_PRINCIPAL)
+    (map-set admins new-admin true)
+    (ok true)
+  )
+)
 
 ;; Zone Management
 (define-public (create-zone (name (string-ascii 50)) (max-decibel uint) (is-quiet-zone bool))
@@ -156,6 +199,7 @@
       (zone-id (var-get next-zone-id))
       (premium (if is-quiet-zone u200 u100)) ;; 200% premium for quiet zones
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (and (>= max-decibel MIN_DECIBEL) (<= max-decibel MAX_DECIBEL)) ERR_INVALID_DECIBEL)
     (asserts! (or (not is-quiet-zone) (<= max-decibel QUIET_ZONE_LIMIT)) ERR_INVALID_DECIBEL)
     
@@ -187,8 +231,11 @@
       (zone-owner (unwrap! (map-get? zone-owners zone-id) ERR_UNAUTHORIZED))
       (expiry-block (+ stacks-block-height duration-blocks))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (is-eq recipient tx-sender)) ERR_INVALID_PRINCIPAL)
     (asserts! (is-eq tx-sender zone-owner) ERR_UNAUTHORIZED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
     
     (map-set allowances 
       { zone-id: zone-id, owner: recipient }
@@ -210,6 +257,7 @@
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
       (timestamp stacks-block-height)
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (and (>= decibel-level MIN_DECIBEL) (<= decibel-level MAX_DECIBEL)) ERR_INVALID_DECIBEL)
     
     (map-set noise-readings 
@@ -238,6 +286,8 @@
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
       (fee (unwrap! (calculate-permit-fee zone-id requested-decibels duration-blocks) ERR_NOT_FOUND))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
     (asserts! (and (>= requested-decibels MIN_DECIBEL) (<= requested-decibels MAX_DECIBEL)) ERR_INVALID_DECIBEL)
     
     (map-set construction-permits permit-id {
@@ -263,8 +313,10 @@
       (zone-id (get zone-id permit))
       (zone-owner (unwrap! (map-get? zone-owners zone-id) ERR_UNAUTHORIZED))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (is-eq tx-sender zone-owner) ERR_UNAUTHORIZED)
     (asserts! (not (get approved permit)) ERR_PERMIT_EXISTS)
+    (asserts! (not (is-eq tx-sender (get applicant permit))) ERR_INVALID_PRINCIPAL)
     
     (map-set construction-permits permit-id
       (merge permit { 
@@ -285,8 +337,12 @@
       (token-id (+ (var-get last-token-id) u1))
       (allowance-data (unwrap! (map-get? allowances { zone-id: zone-id, owner: tx-sender }) ERR_NOT_FOUND))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (var-get reentrancy-guard)) ERR_REENTRANCY)
+    (asserts! (> (get expiry-block allowance-data) stacks-block-height) ERR_ALLOWANCE_EXPIRED)
     (asserts! (>= (- (get total-allowance allowance-data) (get used-allowance allowance-data)) decibel-amount) ERR_INSUFFICIENT_ALLOWANCE)
     (asserts! (> price u0) ERR_INVALID_AMOUNT)
+    (asserts! (> decibel-amount u0) ERR_INVALID_AMOUNT)
     
     (try! (nft-mint? noise-allowance token-id tx-sender))
     (var-set last-token-id token-id)
@@ -309,6 +365,9 @@
       (offer (unwrap! (map-get? trade-offers token-id) ERR_NOT_FOUND))
       (seller (get seller offer))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (var-get reentrancy-guard)) ERR_REENTRANCY)
+    (var-set reentrancy-guard true)
     (asserts! (get active offer) ERR_NOT_FOUND)
     (asserts! (not (is-eq tx-sender seller)) ERR_UNAUTHORIZED)
     
@@ -323,6 +382,7 @@
       (merge offer { active: false })
     )
     
+    (var-set reentrancy-guard false)
     (ok true)
   )
 )
@@ -333,6 +393,7 @@
     (
       (proposal-id (var-get next-proposal-id))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (and (>= proposed-max-decibel MIN_DECIBEL) (<= proposed-max-decibel MAX_DECIBEL)) ERR_INVALID_DECIBEL)
     (asserts! (is-some (map-get? zones zone-id)) ERR_ZONE_NOT_FOUND)
     
@@ -360,8 +421,10 @@
       (proposal (unwrap! (map-get? proposals proposal-id) ERR_NOT_FOUND))
       (current-vote (map-get? votes { proposal-id: proposal-id, voter: tx-sender }))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (< stacks-block-height (get end-block proposal)) ERR_VOTING_PERIOD_ACTIVE)
     (asserts! (is-none current-vote) ERR_ALREADY_VOTED)
+    (asserts! (not (is-eq tx-sender (get proposer proposal))) ERR_INVALID_PRINCIPAL)
     
     (map-set votes { proposal-id: proposal-id, voter: tx-sender } vote-yes)
     
@@ -384,6 +447,7 @@
       (zone (unwrap! (map-get? zones zone-id) ERR_ZONE_NOT_FOUND))
       (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
     )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (>= stacks-block-height (get end-block proposal)) ERR_VOTING_PERIOD_ACTIVE)
     (asserts! (not (get executed proposal)) ERR_ALREADY_EXISTS)
     (asserts! (>= total-votes MIN_VOTES_REQUIRED) ERR_INVALID_VOTE)
@@ -474,6 +538,8 @@
         { total-allowance: u0, used-allowance: u0, expiry-block: u0 }
         (map-get? allowances { zone-id: zone-id, owner: to })))
     )
+    (asserts! (not (is-eq from to)) ERR_INVALID_PRINCIPAL)
+    (asserts! (> (get expiry-block from-allowance) stacks-block-height) ERR_ALLOWANCE_EXPIRED)
     (asserts! (>= (- (get total-allowance from-allowance) (get used-allowance from-allowance)) amount) ERR_INSUFFICIENT_ALLOWANCE)
     
     ;; Update from allowance
@@ -494,7 +560,9 @@
 ;; NFT transfer function
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
   (begin
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (is-eq tx-sender sender) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq sender recipient)) ERR_INVALID_PRINCIPAL)
     (try! (nft-transfer? noise-allowance token-id sender recipient))
     (ok true)
   )
